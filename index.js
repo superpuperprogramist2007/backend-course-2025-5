@@ -1,10 +1,11 @@
 const http = require("http");
-const fs = require("fs"); // Звичайний fs для sync операцій (перевірка папки)
-const fsPromises = require("fs").promises; // Проміси для читання/запису файлів (вимога лаби)
+const fs = require("fs");
+const fsPromises = require("fs").promises;
 const path = require("path");
 const { Command } = require("commander");
+const superagent = require("superagent"); // Підключаємо superagent
 
-// === 1. Налаштування Commander ===
+// === Setup Commander ===
 const program = new Command();
 
 program
@@ -15,21 +16,18 @@ program
 program.parse(process.argv);
 const options = program.opts();
 
-// === 2. Перевірка папки кешу ===
+// === Ensure cache directory exists ===
 if (!fs.existsSync(options.cache)) {
   fs.mkdirSync(options.cache, { recursive: true });
-  console.log(`Created cache directory: ${options.cache}`);
+  console.log(` Created cache directory: ${options.cache}`);
 }
 
-// === 3. Допоміжна функція для отримання шляху до файлу ===
 const getFilePath = (code) => path.join(options.cache, `${code}.jpg`);
 
-// === 4. Створення сервера ===
+// === Server Logic ===
 const server = http.createServer(async (req, res) => {
-  // Отримуємо код з URL (наприклад, /200 -> "200")
-  const code = req.url.substring(1);
+  const code = req.url.substring(1); // беремо "200" з "/200"
 
-  // Якщо код не задано, повертаємо 404
   if (!code) {
     res.writeHead(404, { "Content-Type": "text/plain" });
     return res.end("Not Found");
@@ -38,56 +36,70 @@ const server = http.createServer(async (req, res) => {
   const filePath = getFilePath(code);
 
   try {
-    // --- METHOD: GET (Отримати картинку) ---
+    // --- METHOD: GET ---
     if (req.method === "GET") {
-      const image = await fsPromises.readFile(filePath);
-      res.writeHead(200, { "Content-Type": "image/jpeg" }); // [cite: 54]
-      res.end(image);
+      try {
+        // 1. Спробуємо знайти файл у кеші
+        const image = await fsPromises.readFile(filePath);
+        res.writeHead(200, { "Content-Type": "image/jpeg" });
+        res.end(image);
+      } catch (err) {
+        // 2. Якщо файлу немає (ENOENT), йдемо на http.cat
+        if (err.code === "ENOENT") {
+          console.log(`Cache miss for ${code}. Fetching from http.cat...`);
+          try {
+            // Робимо запит на зовнішній сервер
+            const remoteRes = await superagent.get(`https://http.cat/${code}`);
+            
+            // Зберігаємо отриману картинку в кеш (remoteRes.body - це буфер картинки)
+            await fsPromises.writeFile(filePath, remoteRes.body);
+            
+            // Віддаємо картинку клієнту
+            res.writeHead(200, { "Content-Type": "image/jpeg" });
+            res.end(remoteRes.body);
+          } catch (remoteErr) {
+            // Якщо і на http.cat такого коду немає (наприклад, код 999)
+            console.error(`Error fetching from http.cat: ${remoteErr.status}`);
+            res.writeHead(404, { "Content-Type": "text/plain" });
+            res.end("Not Found on http.cat");
+          }
+        } else {
+          throw err; // Інші помилки кидаємо далі
+        }
+      }
     } 
-    // --- METHOD: PUT (Зберегти картинку) ---
+    // --- METHOD: PUT ---
     else if (req.method === "PUT") {
-      // Створюємо потік запису у файл
       const writeStream = fs.createWriteStream(filePath);
-      
-      // Перенаправляємо дані з запиту прямо у файл
       req.pipe(writeStream);
-
-      req.on('end', () => {
-          res.writeHead(201, { "Content-Type": "text/plain" }); // [cite: 53]
-          res.end("Created");
-      });
-      
-      req.on('error', (err) => {
-          console.error(err);
-          res.writeHead(500);
-          res.end("Server Error");
+      req.on("end", () => {
+        res.writeHead(201, { "Content-Type": "text/plain" });
+        res.end("Created");
       });
     } 
-    // --- METHOD: DELETE (Видалити картинку) ---
+    // --- METHOD: DELETE ---
     else if (req.method === "DELETE") {
       await fsPromises.unlink(filePath);
       res.writeHead(200, { "Content-Type": "text/plain" });
       res.end("OK");
     } 
-    // --- ІНШІ МЕТОДИ ---
+    // --- OTHER METHODS ---
     else {
-      res.writeHead(405, { "Content-Type": "text/plain" }); // [cite: 50]
+      res.writeHead(405, { "Content-Type": "text/plain" });
       res.end("Method Not Allowed");
     }
   } catch (error) {
-    // Якщо файлу немає (помилка ENOENT), повертаємо 404
     if (error.code === 'ENOENT') {
-        res.writeHead(404, { "Content-Type": "text/plain" }); // [cite: 51]
+        res.writeHead(404, { "Content-Type": "text/plain" });
         res.end("Not Found");
     } else {
-        console.error("Server error:", error);
+        console.error("Server Error:", error);
         res.writeHead(500, { "Content-Type": "text/plain" });
         res.end("Internal Server Error");
     }
   }
 });
 
-// === 5. Запуск ===
 server.listen(options.port, options.host, () => {
   console.log(`Server running at http://${options.host}:${options.port}/`);
   console.log(`Cache path: ${options.cache}`);
